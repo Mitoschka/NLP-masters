@@ -1,6 +1,8 @@
+from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
@@ -16,10 +18,13 @@ n_layer = 6
 dropout = 0.2
 # ------------
 
-torch.manual_seed(1337)
+torch.manual_seed(42)
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('input.txt', 'r', encoding='utf-8') as f:
+# replace with the file path
+PATH = "/home/michael/Desktop/NLP/NLP-masters/Task 2/" 
+
+# wget https://raw.githubusercontent.com/averkij/woland/main/text/ru.txt
+with open(PATH + "ru.txt", 'r', encoding='utf-8') as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -194,14 +199,91 @@ class GPTLanguageModel(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
+        
+class SwitchBlock(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.switch = nn.Parameter(torch.ones(1)) # Learnable switch parameter
 
-model = GPTLanguageModel()
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x)) * self.switch
+        x = x + self.ffwd(self.ln2(x)) * self.switch
+        return x
+
+
+class GPTLanguageModelWithSwitch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[SwitchBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+
+        # idx and targets are both (B,T) tensor of integers
+        tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
+        x = self.ln_f(x) # (B,T,C)
+        logits = self.lm_head(x) # (B,T,vocab_size)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+    
+    def generate(self, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            # get the predictions
+            logits, loss = self(idx_cond)
+            # focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
+
+# ------------    
+model = GPTLanguageModelWithSwitch() # choose from two models ( GPTLanguageModel | GPTLanguageModelWithSwitch )
+
 m = model.to(device)
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# initialize list to store losses
+losses_list = []
 
 for iter in range(max_iters):
 
@@ -215,11 +297,60 @@ for iter in range(max_iters):
 
     # evaluate the loss
     logits, loss = model(xb, yb)
+
+    # store the losses
+    losses_list.append(loss.item())
+
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
+# save model
+torch.save(model.state_dict(), PATH + "model.pth")
+
+# calculate the exponent of losses
+exponent_losses_gpt = torch.exp(torch.tensor(losses_list))
+
+# convert the tensor back to a list for plotting
+exp_losses_list = exponent_losses_gpt.tolist()
+
+
+# write exponent losses from list to file
+with open(PATH + 'exponent_losses.txt', 'w') as f:
+    for line in exp_losses_list:
+        f.write(f"{line}\n")
+
+# get the last exponent of losses
+exp_losses_last = exp_losses_list[-1]
+
+# plotting the data
+plt.plot(exp_losses_list)
+plt.title('Exponential of Losses')
+plt.xlabel('Index')
+plt.ylabel('Exponential of Loss')
+plt.savefig(PATH + 'losses.png')
+
+
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+open(PATH + 'more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+
+
+# ------------
+# last exponents of losses from file
+# the values of these variables were written manually
+DEFAULT = 2.353518009185791
+SWITCH = 2.277348756790161
+
+labels = ['Default Model', 'Switch Transformer']
+values = [DEFAULT, SWITCH]
+
+
+plt.bar(labels, values)
+
+
+plt.xlabel('Models')
+plt.ylabel('Exponential of Loss')
+plt.title('Perplexities')
+plt.savefig(PATH + 'perplexity.png')
